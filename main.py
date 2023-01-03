@@ -3,11 +3,11 @@
 # pylint: disable=missing-module-docstring
 # pylint: disable=unspecified-encoding
 
+import os, json, re
+import dropbox
 import discord
 from discord import app_commands
-import dropbox
 from datetime import datetime,timedelta
-import os, json
 from pprint import pformat
 
 import matplotlib.ticker as mticker
@@ -18,7 +18,10 @@ import requests
 
 DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 DISCORD_GUILD = os.environ['DISCORD_GUILD']
+DISCORD_CHANNEL = os.environ['DISCORD_CHANNEL']
 DISCORD_THREAD_1 = os.environ['DISCORD_THREAD_1']
+DISCORD_THREAD_2 = os.environ['DISCORD_THREAD_2']
+DISCORD_LEADERBOARD_BOT = os.environ['DISCORD_LEADERBOARD_BOT']
 DROPBOX_APP_KEY = os.environ['DROPBOX_APP_KEY']
 DROPBOX_APP_SECRET = os.environ['DROPBOX_APP_SECRET']
 DROPBOX_ACCESS_TOKEN = os.environ['DROPBOX_ACCESS_TOKEN']
@@ -47,9 +50,7 @@ class Pick():
   def __init__(self, ordinal, reroll=False):
     # fyi, ordinal is the number of days since 0001-01-01. I use it to uniquely identify each day
     self.day = ordinal
-    print(self.load())
     if reroll or not self.load():
-      print("I got here!")
       self.start_scores = self.random()
     self.end_scores = self.get_frontier()
     self.save()
@@ -135,7 +136,14 @@ class Pick():
     date = datetime.fromordinal(self.day)
     scores_names = score_string(self.start_scores, self.category)
     link = self.get_leaderboard_link()
-    return f"```Daily Pareto for {date:%B %d, %Y}:\n{self.flags}({self.category}) for {self.puzzle['displayName']}\n{scores_names}```\n<{link}>\n"
+    return discord.Embed(color=discord.Color.dark_gold(),title=f"Daily Pareto for {date:%B %d, %Y}", description=f"{self.flags}({self.category}) for {self.puzzle['displayName']}: [zlbb 🔗]({link})\n```{scores_names}```")
+
+  def get_results_post(self,submitters):
+    date = datetime.fromordinal(self.day)
+    filename = self.make_chart()
+    embed = discord.Embed(color=discord.Color.gold(),title=f"Daily Pareto Results for {date:%B %d, %Y}", description=f"Submissions by {', '.join(submitters)}")
+    embed.set_image(url=f'attachment://{filename}')
+    return embed
 
   def get_leaderboard_link(self):
     link = f'https://zlbb.faendir.com/puzzles/{self.puzzle["id"]}/visualizer?visualizerFilter-{self.puzzle["id"]}.showOnlyFrontier=true&visualizerConfig.mode=2D&visualizerConfig.x={self.category[0].lower()}&visualizerConfig.y={self.category[1].lower()}'
@@ -150,10 +158,11 @@ class Pick():
       pass
     return link
 
-  def make_chart(self, day):
+  def make_chart(self, local_name='yesterday'):
     date = datetime.fromordinal(self.day)
     pl.clf()
-    pl.figure(figsize=(12, 10), layout='tight')
+    pl.figure(figsize=(8, 6), layout='tight')
+    pl.rc('font', size=18)
     pl.style.use('dark_background')
     pl.title(f"{self.flags}({self.category}) for {self.puzzle['displayName']} {date:%Y-%m-%d} ")
     pl.xlabel(catmap[self.category[0]])
@@ -182,9 +191,10 @@ class Pick():
     if len(keep): pl.plot(*zip(*keep), 'ro', ms=8)
     if len(new): pl.plot(*zip(*new), 'go', ms=8)
   
-    pl.savefig(f'{day}.png')
-    with open(f'{day}.png','rb') as f:
+    pl.savefig(f'{local_name}.png')
+    with open(f'{local_name}.png','rb') as f:
       dbx.files_upload(f.read(),f"/charts/{self.day}.png",mode=dropbox.files.WriteMode.overwrite)
+    return f'{local_name}.png'
 
 @discord.app_commands.checks.has_role('reroller')
 @tree.command(name = "daily_reroll", description = "Reroll the daily.", guild=discord.Object(id=DISCORD_GUILD))
@@ -197,15 +207,49 @@ async def reroll(interaction):
   today = datetime.now()
   ordinal = today.toordinal()
   pick = Pick(ordinal,reroll=True)
-  await A.send(pick.get_discord_announcement())
-  await interaction.response.send_message("Rerolled the daily pareto.",ephemeral=True)
+  await A.send(embed=pick.get_discord_announcement())
 
+@discord.app_commands.checks.has_role('reroller')
+@tree.command(name = "test", description = "temporary test command.", guild=discord.Object(id=DISCORD_GUILD))
+async def test(interaction):
+  today = datetime.now()
+  ordinal = today.toordinal()
+  thread = await client.fetch_channel(DISCORD_THREAD_1)
+  misc = await client.fetch_channel(DISCORD_THREAD_2)
+  om = await client.fetch_channel(DISCORD_CHANNEL)
+  leaderboard_bot = await client.fetch_user(DISCORD_LEADERBOARD_BOT)
+  time = datetime.fromordinal(ordinal-1)+timedelta(hours=12)
+  print(time)
+  print(today)
+  pick = Pick(ordinal-1)
+  submitters = set()
+  conditions = lambda x: ((x.author == leaderboard_bot) and (len(x.embeds) > 0) and \
+  ('New Submission' in x.embeds[0].title) and \
+  (re.search(r'\*(.*)\*',x.embeds[0].title).group(1) == pick.puzzle['displayName']))
+  async for message in misc.history(after=time,limit=10):
+    if conditions(message):
+      print(message.author,message.embeds[0].title)
+      submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
+  async for message in om.history(after=time,limit=20):
+    if conditions(message):
+      print(message.author,message.embeds[0].title)
+      submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
+  with open('yesterday.png','rb') as f:
+    await thread.send(embed=pick.get_results_post(submitters), file=discord.File(f,filename='yesterday.png'))
+  await thread.send(embed=pick.get_discord_announcement())
 
 @client.event
 async def on_ready():
   await tree.sync(guild=discord.Object(id=DISCORD_GUILD))
-  A = await client.fetch_channel(DISCORD_THREAD_1)
-  await A.join()
+  thread = await client.fetch_channel(DISCORD_THREAD_1)
+  misc = await client.fetch_channel(DISCORD_THREAD_2)
+  om = await client.fetch_channel(DISCORD_CHANNEL)
+  leaderboard_bot = await client.fetch_user(DISCORD_LEADERBOARD_BOT)
+  await thread.join()
+  conditions = lambda x: ((x.author == leaderboard_bot) and (len(x.embeds) > 0) and \
+  ('New Submission' in x.embeds[0].title) and \
+  (re.search(r'\*(.*)\*',x.embeds[0].title).group(1) == pick.puzzle['displayName']))
+  print('Ready!')
   while True:
     today = datetime.now()
     ordinal = today.toordinal()
@@ -216,14 +260,24 @@ async def on_ready():
     announce_time = datetime.fromordinal(ordinal+(last_upload+1 == ordinal)) + timedelta(hours=12)
 #    announce_time = today + timedelta(minutes=1)
     await discord.utils.sleep_until(announce_time)
+    submitters = set()
+    async for message in misc.history(after=announce_time,limit=10):
+      if conditions(message):
+        print(message.author,message.embeds[0].title)
+        submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
+    async for message in om.history(after=announce_time,limit=20):
+      if conditions(message):
+        print(message.author,message.embeds[0].title)
+        submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
     today = datetime.now()
     ordinal = today.toordinal()
     pick_old = Pick(ordinal-1)
     pick = Pick(ordinal)
     pick_old.make_chart('yesterday')
     with open('yesterday.png','rb') as f:
-      await A.send(file=discord.File(f))
-    await A.send(pick.get_discord_announcement())
+      await thread.send(embed=pick_old.get_results_post(submitters), 
+ file=discord.File(f,filename='yesterday.png'))
+    await thread.send(embed=pick.get_discord_announcement())
 
 reload = False
 if reload or not os.path.isfile('puzzle.json'):
