@@ -4,8 +4,10 @@
 # pylint: disable=unspecified-encoding
 
 import discord
+from discord import app_commands
 import dropbox
-import datetime, os, json
+from datetime import datetime,timedelta
+import os, json
 from pprint import pformat
 
 import matplotlib.ticker as mticker
@@ -14,17 +16,20 @@ import matplotlib.pyplot as pl
 import numpy as np
 import requests
 
-BOT_TOKEN = os.environ['BOT_TOKEN']
-DROPBOX_TOKEN = os.environ['DROPBOX_TOKEN']
+DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
+DISCORD_GUILD = os.environ['DISCORD_GUILD']
+DISCORD_THREAD_1 = os.environ['DISCORD_THREAD_1']
+DROPBOX_APP_KEY = os.environ['DROPBOX_APP_KEY']
+DROPBOX_APP_SECRET = os.environ['DROPBOX_APP_SECRET']
+DROPBOX_ACCESS_TOKEN = os.environ['DROPBOX_ACCESS_TOKEN']
+DROPBOX_REFRESH_TOKEN = os.environ['DROPBOX_REFRESH_TOKEN']
 
-dbx = dropbox.Dropbox(DROPBOX_TOKEN)
+intents = discord.Intents(dm_messages=True, messages=True, message_content=True, members=True, guilds=True)
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
 
-#intents = discord.Intents(dm_messages=True, dm_reactions=True, members=True, guilds=True)
-#bot = discord.commands.Bot(command_prefix='!',
-#                           description="File upload bot"
-#                           + "\nUploads files to Dropbox",
-#                           case_insensitive=True,intents=intents)
-
+dbx = dropbox.Dropbox(oauth2_access_token=DROPBOX_ACCESS_TOKEN,oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
+                      app_key=DROPBOX_APP_KEY,app_secret=DROPBOX_APP_SECRET)
 
 def normed(x):
   return x / np.sum(x)
@@ -42,7 +47,9 @@ class Pick():
   def __init__(self, ordinal, reroll=False):
     # fyi, ordinal is the number of days since 0001-01-01. I use it to uniquely identify each day
     self.day = ordinal
+    print(self.load())
     if reroll or not self.load():
+      print("I got here!")
       self.start_scores = self.random()
     self.end_scores = self.get_frontier()
     self.save()
@@ -64,12 +71,11 @@ class Pick():
 
       probs = normed(categories_weight[self.puzzle['type'] == 'PRODUCTION'])
       self.category = ''.join(rng.choice(categories, 3, False, p=probs))
-      self.category, self.min_flag = ''.join(sorted(
-        self.category[:2])), self.category[2]
+      self.category, self.min_flag = ''.join(sorted(self.category[:2])), self.category[2]
       self.flags = ''.join(
         (rng.choice(['', 'O'], p=[0.99,0.01]),
          rng.choice(['', 'T'], p=[0.9, 0.1]),
-         rng.choice(['', self.min_flag], p=[0, 1])))
+         rng.choice(['', self.min_flag], p=[0.95, 0.05])))
 
       # gets the scores.  if there is ever a problem with the category, it will return None which forces this function to reroll category
       scores = self.get_frontier()
@@ -114,9 +120,7 @@ class Pick():
       pass
 
     # pull out the scored metrics for today
-    scores = [
-      tuple(f['score'][catmap[c]] for c in self.category) for f in frontier
-    ]
+    scores = [tuple(f['score'][catmap[c]] for c in self.category) for f in frontier]
     if None in scores[0]:
       # if one of the scores is None, give up. something is wrong with one of the puzzles.  
       # this will trigger a reroll
@@ -124,17 +128,14 @@ class Pick():
 
     # filter pareto
     scores = sorted(set(scores))
-    scores = [
-      a for a in scores if not any(pareto_compare(a, b) for b in scores)
-    ]
-
+    scores = [a for a in scores if not any(pareto_compare(a, b) for b in scores)]
     return scores
 
   def get_discord_announcement(self):
-    date = datetime.date.fromordinal(self.day)
+    date = datetime.fromordinal(self.day)
     scores_names = score_string(self.start_scores, self.category)
     link = self.get_leaderboard_link()
-    return f"```Daily Pareto for {date:%B %d, %Y}:\n{self.flags}({self.category}) for {self.puzzle['displayName']}\n{scores_names}```\n{link}\n"
+    return f"```Daily Pareto for {date:%B %d, %Y}:\n{self.flags}({self.category}) for {self.puzzle['displayName']}\n{scores_names}```\n<{link}>\n"
 
   def get_leaderboard_link(self):
     link = f'https://zlbb.faendir.com/puzzles/{self.puzzle["id"]}/visualizer?visualizerFilter-{self.puzzle["id"]}.showOnlyFrontier=true&visualizerConfig.mode=2D&visualizerConfig.x={self.category[0].lower()}&visualizerConfig.y={self.category[1].lower()}'
@@ -149,22 +150,19 @@ class Pick():
       pass
     return link
 
-  def make_chart(self, i):
-    date = datetime.date.fromordinal(self.day)
-
-    # idk if I'm using this charting library right, but it's working so I'm going with it.
-    pl.figure(figsize=(12, 5), layout='tight')
+  def make_chart(self, day):
+    date = datetime.fromordinal(self.day)
+    pl.clf()
+    pl.figure(figsize=(12, 10), layout='tight')
     pl.style.use('dark_background')
-    pl.title(
-      f"{self.flags}({self.category}) for {self.puzzle['displayName']} {date:%Y-%m-%d} "
-    )
+    pl.title(f"{self.flags}({self.category}) for {self.puzzle['displayName']} {date:%Y-%m-%d} ")
     pl.xlabel(catmap[self.category[0]])
     pl.ylabel(catmap[self.category[1]])
     pl.grid(True, which='both', alpha=.25)
     if True:
       pl.loglog()
       ax = pl.gca()
-
+  
       # I like more labels on the lines than it gives by default.  but this is a little bit too much sometimes
       ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
       ax.xaxis.set_minor_formatter(mticker.ScalarFormatter())
@@ -172,63 +170,101 @@ class Pick():
       ax.yaxis.set_minor_formatter(mticker.ScalarFormatter())
       ax.spines['top'].set_visible(False)
       ax.spines['right'].set_visible(False)
-
+  
     # still looking for a good way to render infinities, but filtering them out for now
     start = set(tuple(s) for s in self.start_scores if np.inf not in s)
     end = set(tuple(s) for s in self.end_scores if np.inf not in s)
-
+  
     dead = start.difference(end)
     keep = start.intersection(end)
     new = end.difference(start)
     if len(dead): pl.plot(*zip(*dead), 'ro', ms=8, fillstyle='none')
     if len(keep): pl.plot(*zip(*keep), 'ro', ms=8)
     if len(new): pl.plot(*zip(*new), 'go', ms=8)
-
-    pl.savefig({0: 'today', 1: 'yesterday'}.get(i, 'chart') + '.png')
-    with open({0: 'today', 1: 'yesterday'}.get(i, 'chart') + '.png','rb') as f:
+  
+    pl.savefig(f'{day}.png')
+    with open(f'{day}.png','rb') as f:
       dbx.files_upload(f.read(),f"/charts/{self.day}.png",mode=dropbox.files.WriteMode.overwrite)
-    
 
-if __name__ == '__main__':
-  reload = False
-  if reload or not os.path.isfile('puzzle.json'):
-    puzzles = requests.get('https://zlbb.faendir.com/om/puzzles').json()
-    with open('puzzles.json', 'w') as file:
-      json.dump(puzzles, file)
-  else:
-    with open('puzzles.json', 'r') as file:
-      puzzles = json.load(file)
+@discord.app_commands.checks.has_role('reroller')
+@tree.command(name = "daily_reroll", description = "Reroll the daily.", guild=discord.Object(id=DISCORD_GUILD))
+async def reroll(interaction):
+  A = await client.fetch_channel(DISCORD_THREAD_1)
+  async for message in A.history(limit=200):
+      if message.author == client.user:
+          await message.delete()
+          break
+  today = datetime.now()
+  ordinal = today.toordinal()
+  pick = Pick(ordinal,reroll=True)
+  await A.send(pick.get_discord_announcement())
+  await interaction.response.send_message("Rerolled the daily pareto.",ephemeral=True)
 
-  # TODO: filter out puzzles like stab water
 
-  chapter_puzzles = tuple(
-    filter(lambda x: 'CHAPTER' in x['group']['id'], puzzles))
-  journal_puzzles = tuple(
-    filter(lambda x: 'JOURNAL' in x['group']['id'], puzzles))
-  tournament_puzzles = tuple(
-    filter(lambda x: 'TOURNAMENT' in x['group']['id'], puzzles))
-
-  grouped_puzzles = np.array(
-    [chapter_puzzles, journal_puzzles, tournament_puzzles], dtype=object)
-  grouped_puzzles_weight = normed([3, 2, 1])
-
-  # I'd kind of like to do this in a better datastructure so the names/weights are more closely tied together
-  categories = ['G', 'C', 'A', 'I', 'R', 'H', 'W']
-  categories_weight = [[2, 2, 2, 2, 1, 1, 1], [2, 2, 2, 2, 1, 0, 0]]  # disable AHW in production.  probably needs a cleaner way
-  catmap = {
-    'G': 'cost',
-    'C': 'cycles',
-    'A': 'area',
-    'I': 'instructions',
-    'R': 'rate',
-    'H': 'height',
-    'W': 'width'
-  }
-
-  for i in [0, 1]:
-    ordinal = datetime.date.today().toordinal() - i
+@client.event
+async def on_ready():
+  await tree.sync(guild=discord.Object(id=DISCORD_GUILD))
+  A = await client.fetch_channel(DISCORD_THREAD_1)
+  await A.join()
+  while True:
+    today = datetime.now()
+    ordinal = today.toordinal()
+    try:
+      last_upload = int([i.name for i in dbx.files_list_folder('/charts').entries][-1].split('.')[0])
+    except IndexError:
+      last_upload = 1
+    announce_time = datetime.fromordinal(ordinal+(last_upload+1 == ordinal)) + timedelta(hours=12)
+#    announce_time = today + timedelta(minutes=1)
+    await discord.utils.sleep_until(announce_time)
+    today = datetime.now()
+    ordinal = today.toordinal()
+    pick_old = Pick(ordinal-1)
     pick = Pick(ordinal)
-    print(pick)
-    print(pick.get_discord_announcement())
-    pick.make_chart(i)
-    print()
+    pick_old.make_chart('yesterday')
+    with open('yesterday.png','rb') as f:
+      await A.send(file=discord.File(f))
+    await A.send(pick.get_discord_announcement())
+
+reload = False
+if reload or not os.path.isfile('puzzle.json'):
+  puzzles = requests.get('https://zlbb.faendir.com/om/puzzles').json()
+  with open('puzzles.json', 'w') as file:
+    json.dump(puzzles, file)
+else:
+  with open('puzzles.json', 'r') as file:
+    puzzles = json.load(file)
+
+# TODO: filter out puzzles like stab water
+
+chapter_puzzles = tuple(filter(lambda x: 'CHAPTER' in x['group']['id'], puzzles))
+journal_puzzles = tuple(filter(lambda x: 'JOURNAL' in x['group']['id'], puzzles))
+tournament_puzzles = tuple(filter(lambda x: 'TOURNAMENT' in x['group']['id'], puzzles))
+
+grouped_puzzles = np.array([chapter_puzzles, journal_puzzles, tournament_puzzles], dtype=object)
+grouped_puzzles_weight = normed([3, 2, 1])
+
+# I'd kind of like to do this in a better datastructure so the names/weights are more closely tied together
+categories = ['G', 'C', 'A', 'I', 'R', 'H', 'W']
+categories_weight = [[2, 2, 2, 2, 1, 1, 1], [2, 2, 2, 2, 1, 0, 0]]  # disable AHW in production.  probably needs a cleaner way
+catmap = {'G': 'cost','C': 'cycles','A': 'area','I': 'instructions','R': 'rate','H': 'height','W': 'width'}
+
+client.run(DISCORD_BOT_TOKEN)
+
+
+
+
+#  for i in ['today', 'yesterday']:
+#    ordinal = datetime.date.today().toordinal() - (i=='yesterday')
+#    pick = Pick(ordinal)
+#    print(pick)
+#    print(pick.get_discord_announcement())
+#    pick.make_chart(i)
+#    print()
+  
+# lines to generate access token and refresh token, need to make it more formal later.
+#A = dropbox.oauth.DropboxOAuth2FlowNoRedirect(DROPBOX_APP_KEY,DROPBOX_APP_SECRET,token_access_type='offline')
+#print(A.start())
+#auth_code = input()
+#B = A.finish(auth_code)
+#print(f"Access Token: {B.access_token}\nRefresh Token: {B.refresh_token}")
+
