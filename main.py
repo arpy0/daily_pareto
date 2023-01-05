@@ -1,21 +1,16 @@
-# pylint: disable=invalid-name
-# pylint: disable=missing-function-docstring
-# pylint: disable=missing-module-docstring
-# pylint: disable=unspecified-encoding
-
 import os, json, re
 import dropbox
 import discord
-from discord import app_commands
-from datetime import datetime,timedelta
 from pprint import pformat
-
-import matplotlib.ticker as mticker
-import matplotlib.pyplot as pl
+from discord import app_commands
+from datetime import datetime,timedelta,timezone
 
 import numpy as np
+import matplotlib.ticker as mticker
+import matplotlib.pyplot as pl
 import requests
 
+# Various tokens and IDs stored as secrets on Replit servers
 DISCORD_BOT_TOKEN = os.environ['DISCORD_BOT_TOKEN']
 DISCORD_GUILD = os.environ['DISCORD_GUILD']
 DISCORD_CHANNEL = os.environ['DISCORD_CHANNEL']
@@ -27,28 +22,41 @@ DROPBOX_APP_SECRET = os.environ['DROPBOX_APP_SECRET']
 DROPBOX_ACCESS_TOKEN = os.environ['DROPBOX_ACCESS_TOKEN']
 DROPBOX_REFRESH_TOKEN = os.environ['DROPBOX_REFRESH_TOKEN']
 
-intents = discord.Intents(dm_messages=True, messages=True, message_content=True, members=True, guilds=True)
+# Setup for the discord bot, declaring intented uses
+intents = discord.Intents(messages=True, message_content=True, members=True, guilds=True)
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 dbx = dropbox.Dropbox(oauth2_access_token=DROPBOX_ACCESS_TOKEN,oauth2_refresh_token=DROPBOX_REFRESH_TOKEN,
                       app_key=DROPBOX_APP_KEY,app_secret=DROPBOX_APP_SECRET)
 
+# TODO: Add logging functionality
+
 def normed(x):
+  """Convenience function to reduce a positive array to percentages."""
   return x / np.sum(x)
 
 def pareto_compare(a, b) -> bool:
-  # return True if a is beat by b
+  """Convenience function to return True if b is ever better in a pareto sense than A"""
+  # Probably can be simplified to a one-liner, but it's fine.
   if a == b:
     return False
   return all(z[0] >= z[1] for z in zip(a, b))
 
 def score_string(scores, category) -> str:
+  """Power one-liner to make a score string out of scores, looks like '100a/90b, 89a/80b', etc."""
   return ', '.join(['/'.join([''.join(z) for z in zip(map(str, s), category.lower())]) for s in scores])
 
 class Pick():
+  """
+  The default class used to generate, store, and load the pick for the daily pareto.
+  All attributes should be JSON-handleable.
+  """
   def __init__(self, ordinal, reroll=False):
-    # fyi, ordinal is the number of days since 0001-01-01. I use it to uniquely identify each day
+    """
+    Load or generate a pick based on its ordinal, the number of days since 01-01-0001
+    End scores will be from start scores after the initial generation assuming submissions have been made.
+    """
     self.day = ordinal
     if reroll or not self.load():
       self.start_scores = self.random()
@@ -56,33 +64,11 @@ class Pick():
     self.save()
 
   def __repr__(self):
+    """Printing a pick object will provide the pprint formatted version of its attributes"""
     return pformat(self.__dict__)
 
-  def random(self):
-    # maybe consider using a seeded random base on date somehow.  it gets messy if you have to reroll though
-    rng = np.random.default_rng()
-
-    self.puzzle = rng.choice(
-      rng.choice(grouped_puzzles, p=grouped_puzzles_weight))
-    scores = None
-    while not scores:
-      # here we're continue rolling category until we get a good one
-      # TODO: don't pick more than 1 of AHW
-      # also, probably ban CR.  all kinds of filtering should be considered
-
-      probs = normed(categories_weight[self.puzzle['type'] == 'PRODUCTION'])
-      self.category = ''.join(rng.choice(categories, 3, False, p=probs))
-      self.category, self.min_flag = ''.join(sorted(self.category[:2])), self.category[2]
-      self.flags = ''.join(
-        (rng.choice(['', 'O'], p=[0.99,0.01]),
-         rng.choice(['', 'T'], p=[0.9, 0.1]),
-         rng.choice(['', self.min_flag], p=[0.95, 0.05])))
-
-      # gets the scores.  if there is ever a problem with the category, it will return None which forces this function to reroll category
-      scores = self.get_frontier()
-    return scores
-
   def load(self) -> bool:
+    """Tries to load the pick from Dropbox, if it fails, return False."""
     try:
       data = dbx.files_download(f"/picks/{self.day}.txt")[1]
       data_json = json.loads(data.content)
@@ -93,11 +79,62 @@ class Pick():
       return False
 
   def save(self):
+    """Saves the pick to Dropbox, as a JSON"""
+    # Note that datetime objects are not JSON serializable so they should not be included as a class object
     dbx.files_upload(bytes(json.dumps(self.__dict__,indent=4),'utf-8'),f"/picks/{self.day}.txt",
-                    mode=dropbox.files.WriteMode.overwrite)
+                     mode=dropbox.files.WriteMode.overwrite)
+
+  def random(self,reload=False):
+    """
+    Generate a pick composed of puzzle and category based on weighted probabilities.
+    Also retrieves currently available scores related to the pick.
+    """
+    # Loads the puzzles from zlbb, or reloads them if desired.
+    if reload or not os.path.isfile('puzzle.json'):
+      puzzles = requests.get('https://zlbb.faendir.com/om/puzzles').json()
+      with open('puzzles.json', 'w') as file:
+        json.dump(puzzles, file)
+    else:
+      with open('puzzles.json', 'r') as file:
+        puzzles = json.load(file)
+    
+    # TODO: filter out puzzles like stab water
+    chapter_puzzles = tuple(filter(lambda x: 'CHAPTER' in x['group']['id'], puzzles))
+    journal_puzzles = tuple(filter(lambda x: 'JOURNAL' in x['group']['id'], puzzles))
+    tournament_puzzles = tuple(filter(lambda x: 'TOURNAMENT' in x['group']['id'], puzzles))
+    
+    # The stock puzzles are given more precedence than journal puzzles due to ease and familiarity
+    grouped_puzzles = np.array([chapter_puzzles, journal_puzzles, tournament_puzzles], dtype=object)
+    grouped_puzzles_weight = normed([3, 2, 1])
+    
+    # Height and Width are unavailable in production since all solutions will be identical (or cheated) there
+    # FUTURE: Account for manifold split
+    categories = ['G', 'C', 'A', 'I', 'R', 'H', 'W']
+    categories_weight = [[2, 2, 2, 2, 1, 1, 1], [2, 2, 2, 2, 1, 0, 0]]
+    
+    rng = np.random.default_rng()
+    self.puzzle = rng.choice(rng.choice(grouped_puzzles, p=grouped_puzzles_weight))
+    scores = None
+    while not scores:
+      # If a bad category is rolled, scores will return None, so this process repeats until a good category is rolled.
+      # The "min_flag" should be unique from the category, so they are generated together.
+      # Each of the flags O, T, and min_flag, have a small chance of being added to the category thereafter.
+      probs = normed(categories_weight[self.puzzle['type'] == 'PRODUCTION'])
+      metrics = ''.join(rng.choice(categories, 3, False, p=probs))
+      self.category, self.min_flag = ''.join(sorted(metrics[:2],key=lambda x: categories.index(x))), metrics[2]
+      self.flags = ''.join(
+        (rng.choice(['', 'O'], p=[0.99,0.01]),
+         rng.choice(['', 'T'], p=[0.9, 0.1]),
+         rng.choice(['', self.min_flag], p=[0.85, 0.15])))
+
+      scores = self.get_frontier()
+    return scores
 
   def get_frontier(self):
-    # todo: maybe should be caching the results incase of a category reroll
+    """
+    Gets the entire pareto frontier from zlbb, 
+    and filters it down to just the category the pick is working with.
+    """
     url = f'https://zlbb.faendir.com/om/puzzle/{self.puzzle["id"]}/records?includeFrontier=true'
     frontier = requests.get(url).json()
     for solution in frontier:
@@ -105,60 +142,65 @@ class Pick():
         solution['score']['rate'] = np.inf
 
     if 'O' not in self.flags:
-      frontier = tuple(
-        filter(lambda x: x['score']['overlap'] == False, frontier))
+      frontier = tuple(filter(lambda x: x['score']['overlap'] == False, frontier))
     if 'T' in self.flags:
-      frontier = tuple(
-        filter(lambda x: x['score']['trackless'] == True, frontier))
-    try:
-      if self.min_flag in self.flags:
-        self.min_score = min(i['score'][catmap[self.min_flag]]
-                             for i in frontier)
-        frontier = tuple(
-          filter(lambda x: x['score'][catmap[self.min_flag]] == self.min_score,
-                 frontier))
-    except AttributeError:
-      pass
+      frontier = tuple(filter(lambda x: x['score']['trackless'] == True, frontier))
+    if self.min_flag in self.flags:
+      self.min_score = min(i['score'][catmap[self.min_flag]] for i in frontier)
+      frontier = tuple(filter(lambda x: x['score'][catmap[self.min_flag]] == self.min_score,frontier))
 
-    # pull out the scored metrics for today
     scores = [tuple(f['score'][catmap[c]] for c in self.category) for f in frontier]
     if None in scores[0]:
-      # if one of the scores is None, give up. something is wrong with one of the puzzles.  
-      # this will trigger a reroll
+      # If a score is ever None, something's gone wrong, return None and reroll.
       return None
 
-    # filter pareto
     scores = sorted(set(scores))
     scores = [a for a in scores if not any(pareto_compare(a, b) for b in scores)]
     return scores
 
-  def get_discord_announcement(self):
+  def get_discord_announcement(self,auto=True):
+    """Generates a Discord embed for the bot to post indicating the category for the day."""
     date = datetime.fromordinal(self.day)
-    scores_names = score_string(self.start_scores, self.category)
+    scores = score_string(self.start_scores, self.category)
     link = self.get_leaderboard_link()
-    return discord.Embed(color=discord.Color.dark_gold(),title=f"Daily Pareto for {date:%B %d, %Y}", description=f"{self.flags}({self.category}) for {self.puzzle['displayName']}: [zlbb 🔗]({link})\n```{scores_names}```")
+    if auto:
+      embed = discord.Embed(color=discord.Color.dark_gold(),
+                            title=f"Daily Pareto for {date:%B %d, %Y}",
+                            description=f"{self.flags}({self.category}) for {self.puzzle['displayName']}: [zlbb 🔗]({link})\n```{scores}```",
+                            timestamp=date + timedelta(hours=12))
+      return embed
+    else:
+      return f"```Daily Pareto for {date:%B %d, %Y}:\n{self.flags}({self.category}) for {self.puzzle['displayName']}\n{scores}```\n{link}\n"
 
-  def get_results_post(self,submitters):
+  
+  def get_results_post(self,submitters,auto=True):
+    """Generates a Discord embed for the bot to post indicating the results for yesterday."""
     date = datetime.fromordinal(self.day)
     filename = self.make_chart()
-    embed = discord.Embed(color=discord.Color.gold(),title=f"Daily Pareto Results for {date:%B %d, %Y}", description=f"Submissions by {', '.join(submitters)}")
-    embed.set_image(url=f'attachment://{filename}')
-    return embed
-
+    description = f"Submissions by {', '.join(submitters)}" if submitters else "No submissions"
+    if auto:
+      embed = discord.Embed(color=discord.Color.gold(),
+                            title=f"Daily Pareto Results for {date:%B %d, %Y}", 
+                            description=description)
+      embed.set_image(url=f'attachment://{filename}')
+      return embed
+  
   def get_leaderboard_link(self):
+    """Generates a URL link to zlbb based on puzzle, category, and set flags."""
     link = f'https://zlbb.faendir.com/puzzles/{self.puzzle["id"]}/visualizer?visualizerFilter-{self.puzzle["id"]}.showOnlyFrontier=true&visualizerConfig.mode=2D&visualizerConfig.x={self.category[0].lower()}&visualizerConfig.y={self.category[1].lower()}'
     if 'O' not in self.flags:
       link += f'&visualizerFilter-{self.puzzle["id"]}.modifiers.overlap=false'
     if 'T' in self.flags:
       link += f'&visualizerFilter-{self.puzzle["id"]}.modifiers.trackless=true'
-    try:
-      if self.min_flag in self.flags:
-        link += f'&visualizerFilter-{self.puzzle["id"]}.range.{self.min_flag.lower()}.max={self.min_score}'
-    except AttributeError:
-      pass
+    if self.min_flag in self.flags:
+      link += f'&visualizerFilter-{self.puzzle["id"]}.range.{self.min_flag.lower()}.max={self.min_score}'
     return link
 
   def make_chart(self, local_name='yesterday'):
+    """
+    Generates a plot showing the results of the daily, comparing current scores to starting scores.
+    Returns the local file name of the chart (with file extension).
+    """
     date = datetime.fromordinal(self.day)
     pl.clf()
     pl.figure(figsize=(8, 6), layout='tight')
@@ -168,19 +210,18 @@ class Pick():
     pl.xlabel(catmap[self.category[0]])
     pl.ylabel(catmap[self.category[1]])
     pl.grid(True, which='both', alpha=.25)
-    if True:
-      pl.loglog()
-      ax = pl.gca()
+    pl.loglog()
+    ax = pl.gca()
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    # Adds additional gridlines, though this might sometimes cause overlap in tick labels
+    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.xaxis.set_minor_formatter(mticker.ScalarFormatter())
+    ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.yaxis.set_minor_formatter(mticker.ScalarFormatter())
   
-      # I like more labels on the lines than it gives by default.  but this is a little bit too much sometimes
-      ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
-      ax.xaxis.set_minor_formatter(mticker.ScalarFormatter())
-      ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
-      ax.yaxis.set_minor_formatter(mticker.ScalarFormatter())
-      ax.spines['top'].set_visible(False)
-      ax.spines['right'].set_visible(False)
-  
-    # still looking for a good way to render infinities, but filtering them out for now
+    # Infinities are not handled presently, perhaps in the future.
     start = set(tuple(s) for s in self.start_scores if np.inf not in s)
     end = set(tuple(s) for s in self.end_scores if np.inf not in s)
   
@@ -199,114 +240,69 @@ class Pick():
 @discord.app_commands.checks.has_role('reroller')
 @tree.command(name = "daily_reroll", description = "Reroll the daily.", guild=discord.Object(id=DISCORD_GUILD))
 async def reroll(interaction):
+  """Discord command to reroll the daily, also deleting the previous mention of it."""
   A = await client.fetch_channel(DISCORD_THREAD_1)
   async for message in A.history(limit=200):
       if message.author == client.user:
           await message.delete()
           break
-  today = datetime.now()
+  today = datetime.now(timezone.utc)
   ordinal = today.toordinal()
   pick = Pick(ordinal,reroll=True)
   await A.send(embed=pick.get_discord_announcement())
 
-@discord.app_commands.checks.has_role('reroller')
-@tree.command(name = "test", description = "temporary test command.", guild=discord.Object(id=DISCORD_GUILD))
-async def test(interaction):
-  today = datetime.now()
-  ordinal = today.toordinal()
-  thread = await client.fetch_channel(DISCORD_THREAD_1)
-  misc = await client.fetch_channel(DISCORD_THREAD_2)
-  om = await client.fetch_channel(DISCORD_CHANNEL)
-  leaderboard_bot = await client.fetch_user(DISCORD_LEADERBOARD_BOT)
-  time = datetime.fromordinal(ordinal-1)+timedelta(hours=12)
-  print(time)
-  print(today)
-  pick = Pick(ordinal-1)
-  submitters = set()
-  conditions = lambda x: ((x.author == leaderboard_bot) and (len(x.embeds) > 0) and \
-  ('New Submission' in x.embeds[0].title) and \
-  (re.search(r'\*(.*)\*',x.embeds[0].title).group(1) == pick.puzzle['displayName']))
-  async for message in misc.history(after=time,limit=10):
-    if conditions(message):
-      print(message.author,message.embeds[0].title)
-      submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
-  async for message in om.history(after=time,limit=20):
-    if conditions(message):
-      print(message.author,message.embeds[0].title)
-      submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
-  with open('yesterday.png','rb') as f:
-    await thread.send(embed=pick.get_results_post(submitters), file=discord.File(f,filename='yesterday.png'))
-  await thread.send(embed=pick.get_discord_announcement())
-
 @client.event
 async def on_ready():
+  """Discord ready event, starts/resumes the loop to post the daily."""
   await tree.sync(guild=discord.Object(id=DISCORD_GUILD))
   thread = await client.fetch_channel(DISCORD_THREAD_1)
   misc = await client.fetch_channel(DISCORD_THREAD_2)
   om = await client.fetch_channel(DISCORD_CHANNEL)
   leaderboard_bot = await client.fetch_user(DISCORD_LEADERBOARD_BOT)
   await thread.join()
+  print('Ready!')
+
+  # Series of conditions to determine if a message is by the leaderboard bot and is a submission message
+  # Pretty fragile as a result, but works for now.
   conditions = lambda x: ((x.author == leaderboard_bot) and (len(x.embeds) > 0) and \
   ('New Submission' in x.embeds[0].title) and \
   (re.search(r'\*(.*)\*',x.embeds[0].title).group(1) == pick.puzzle['displayName']))
-  print('Ready!')
   while True:
-    today = datetime.now()
+    today = datetime.now(timezone.utc)
     ordinal = today.toordinal()
-    try:
-      last_upload = int([i.name for i in dbx.files_list_folder('/charts').entries][-1].split('.')[0])
-    except IndexError:
-      last_upload = 1
+    last_upload = int([i.name for i in dbx.files_list_folder('/charts').entries][-1].split('.')[0])
+    # The daily is announced at noon UTC
     announce_time = datetime.fromordinal(ordinal+(last_upload+1 == ordinal)) + timedelta(hours=12)
-#    announce_time = today + timedelta(minutes=1)
     await discord.utils.sleep_until(announce_time)
-    submitters = set()
-    async for message in misc.history(after=announce_time,limit=10):
-      if conditions(message):
-        print(message.author,message.embeds[0].title)
-        submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
-    async for message in om.history(after=announce_time,limit=20):
-      if conditions(message):
-        print(message.author,message.embeds[0].title)
-        submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
-    today = datetime.now()
+    # The day has to be recalculated in case of bot reconnections and such
+    today = datetime.now(timezone.utc)
     ordinal = today.toordinal()
     pick_old = Pick(ordinal-1)
     pick = Pick(ordinal)
+    submitters = set()
+    # Checks the two channels for any submssions (is this an API expensive operation?)
+    # Would be ideal to just check messages from the leaderboard bot but this doesn't seem to work
+    async for message in misc.history(after=announce_time,limit=1000):
+      if conditions(message):
+        print(message.author,message.embeds[0].title)
+        submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
+    async for message in om.history(after=announce_time,limit=200):
+      if conditions(message):
+        print(message.author,message.embeds[0].title)
+        submitters.add(re.search(r'by (.*) was', message.embeds[0].description).group(1))
     pick_old.make_chart('yesterday')
     with open('yesterday.png','rb') as f:
       await thread.send(embed=pick_old.get_results_post(submitters), 
- file=discord.File(f,filename='yesterday.png'))
+                        file=discord.File(f,filename='yesterday.png'))
     await thread.send(embed=pick.get_discord_announcement())
 
-reload = False
-if reload or not os.path.isfile('puzzle.json'):
-  puzzles = requests.get('https://zlbb.faendir.com/om/puzzles').json()
-  with open('puzzles.json', 'w') as file:
-    json.dump(puzzles, file)
-else:
-  with open('puzzles.json', 'r') as file:
-    puzzles = json.load(file)
-
-# TODO: filter out puzzles like stab water
-
-chapter_puzzles = tuple(filter(lambda x: 'CHAPTER' in x['group']['id'], puzzles))
-journal_puzzles = tuple(filter(lambda x: 'JOURNAL' in x['group']['id'], puzzles))
-tournament_puzzles = tuple(filter(lambda x: 'TOURNAMENT' in x['group']['id'], puzzles))
-
-grouped_puzzles = np.array([chapter_puzzles, journal_puzzles, tournament_puzzles], dtype=object)
-grouped_puzzles_weight = normed([3, 2, 1])
-
-# I'd kind of like to do this in a better datastructure so the names/weights are more closely tied together
-categories = ['G', 'C', 'A', 'I', 'R', 'H', 'W']
-categories_weight = [[2, 2, 2, 2, 1, 1, 1], [2, 2, 2, 2, 1, 0, 0]]  # disable AHW in production.  probably needs a cleaner way
+# Include in the class definition somehow?
 catmap = {'G': 'cost','C': 'cycles','A': 'area','I': 'instructions','R': 'rate','H': 'height','W': 'width'}
 
+# This line must be run after all the Discord commands are defined.
 client.run(DISCORD_BOT_TOKEN)
 
-
-
-
+# TODO: Allow for manual generation of daily again
 #  for i in ['today', 'yesterday']:
 #    ordinal = datetime.date.today().toordinal() - (i=='yesterday')
 #    pick = Pick(ordinal)
@@ -321,4 +317,3 @@ client.run(DISCORD_BOT_TOKEN)
 #auth_code = input()
 #B = A.finish(auth_code)
 #print(f"Access Token: {B.access_token}\nRefresh Token: {B.refresh_token}")
-
